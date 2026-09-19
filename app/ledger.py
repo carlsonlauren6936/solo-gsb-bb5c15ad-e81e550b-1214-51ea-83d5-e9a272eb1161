@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import sqlite3
 from bisect import bisect_right
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Mapping, Optional, Tuple, Union
+from typing import Iterable, Mapping, Optional, Tuple, Union
 
 from fastapi import HTTPException
 
@@ -410,6 +411,231 @@ def _diff_snapshots(
     return changes
 
 
+@dataclass(frozen=True)
+class _TimelineEvent:
+    """One immutable event as seen by :class:`SnapshotTimeline`."""
+
+    event_id: str
+    participant_id: str
+    points: int
+    correction_of: Optional[str]
+    revision: int
+
+
+@dataclass(frozen=True)
+class _FirstCorrection:
+    """The first direct correction that supersedes an event."""
+
+    event_id: str
+    """event_id of the correcting event (the new chain tip)."""
+    from_participant: str
+    """Owner of the superseded target event."""
+    to_participant: str
+    """Owner of the correcting event (may equal ``from_participant``)."""
+    revision: int
+
+
+@dataclass(frozen=True)
+class _ReplayStep:
+    """Everything that happened while the timeline advanced one revision.
+
+    Events written at a revision all become effective in that same revision;
+    a target they correct stops being effective here too — corrections carry
+    strictly larger revisions than their targets, so the first correction of
+    an event is observed once, at the correcting event's own revision.
+    """
+
+    revision: int
+    became_effective: tuple[_TimelineEvent, ...]
+    first_corrections: tuple[_FirstCorrection, ...]
+
+
+class SnapshotTimeline:
+    """Single-pass revision replay over one already-fetched event set.
+
+    The event history (``revision <= to_revision``, one range read, never
+    re-queried per revision) is replayed strictly forward in revision order.
+    The replay state uniformly maintains four things:
+
+    * **effective events** — the current correction-chain tips. An event is
+      effective the moment it is written and stops being effective at its
+      *first* direct correction; a forked chain therefore keeps every
+      branch tip effective while the shared ancestor is superseded once;
+    * **first corrections** — recorded at the first (revision-wise) direct
+      correction of each event; later parallel corrections fork the chain
+      and do not touch it again;
+    * **fork leaves** — the effective set restricted to one chain root; a
+      root with at least two leaves marks a forked correction chain;
+    * **cross-participant ownership** — an effective event always carries
+      its owner's points, so a correction that re-attributes an event from
+      participant A to B debits A and credits B in the same replay step.
+
+    Participants whose effective events net to a non-zero total, or who hold
+    any effective event, are present in the snapshots; this matches
+    :func:`_effective_rows` plus :func:`_aggregate`.
+    """
+
+    def __init__(self, events: Iterable[Mapping[str, object]]):
+        # Group without assuming revisions are contiguous; input order is
+        # preserved within a revision (SQL hands over revision-ascending
+        # rows, and batch inserts assign revisions in request order).
+        self._groups: dict[int, tuple[_TimelineEvent, ...]] = {}
+        order: list[int] = []
+        for r in events:
+            ev = _TimelineEvent(
+                event_id=r["event_id"],
+                participant_id=r["participant_id"],
+                points=r["points"],
+                correction_of=r["correction_of"],
+                revision=r["revision"],
+            )
+            group = self._groups.get(ev.revision)
+            if group is None:
+                self._groups[ev.revision] = (ev,)
+                order.append(ev.revision)
+            else:
+                self._groups[ev.revision] = group + (ev,)
+        self._revision_order: tuple[int, ...] = tuple(sorted(order))
+        self.max_revision = self._revision_order[-1] if self._revision_order else 0
+
+        self.revision = 0
+        self._next_group_index = 0
+        self._effective: dict[str, _TimelineEvent] = {}
+        self._totals: dict[str, int] = {}
+        self._event_counts: dict[str, int] = {}
+        self._chain_root: dict[str, str] = {}
+        # First direct correction per superseded event_id, in replay order.
+        self.first_corrections: list[_FirstCorrection] = []
+
+    @classmethod
+    def load(
+        cls, conn: sqlite3.Connection, to_revision: int
+    ) -> "SnapshotTimeline":
+        """Fetch ``revision <= to_revision`` once and return a fresh replay.
+
+        The single range read is the only event query the range-based
+        endpoints need; ``to_revision == 0`` reads nothing. The returned
+        timeline sits at revision 0 (the empty snapshot); callers drive it
+        forward with :meth:`advance_to`.
+        """
+        rows = conn.execute(
+            "SELECT event_id, participant_id, points, correction_of, revision"
+            " FROM events WHERE revision <= ? ORDER BY revision ASC",
+            (to_revision,),
+        ).fetchall()
+        return cls(rows)
+
+    # -- incremental state ------------------------------------------------
+
+    def _add(self, ev: _TimelineEvent) -> None:
+        self._effective[ev.event_id] = ev
+        self._totals[ev.participant_id] = (
+            self._totals.get(ev.participant_id, 0) + ev.points
+        )
+        self._event_counts[ev.participant_id] = (
+            self._event_counts.get(ev.participant_id, 0) + 1
+        )
+
+    def _remove(self, ev: _TimelineEvent) -> None:
+        pid = ev.participant_id
+        self._totals[pid] -= ev.points
+        self._event_counts[pid] -= 1
+        if self._event_counts[pid] == 0:
+            del self._event_counts[pid]
+            del self._totals[pid]
+
+    def advance_to(self, revision: int) -> _ReplayStep:
+        """Advance forward to ``revision`` (no-op when equal; never rewind)."""
+        if revision < self.revision:
+            raise ValueError(
+                f"SnapshotTimeline cannot rewind: {self.revision} -> {revision}"
+            )
+        became: list[_TimelineEvent] = []
+        corrections: list[_FirstCorrection] = []
+        i = self._next_group_index
+        order = self._revision_order
+        while i < len(order) and order[i] <= revision:
+            rev = order[i]
+            for ev in self._groups[rev]:
+                became.append(ev)
+                target_id = ev.correction_of
+                if target_id is not None and target_id in self._effective:
+                    # First direct correction of ``target_id``: corrections
+                    # arrive in revision order and a target can be replaced
+                    # only once; later parallel corrections fork the chain.
+                    target = self._effective.pop(target_id)
+                    self._remove(target)
+                    correction = _FirstCorrection(
+                        event_id=ev.event_id,
+                        from_participant=target.participant_id,
+                        to_participant=ev.participant_id,
+                        revision=rev,
+                    )
+                    corrections.append(correction)
+                    self.first_corrections.append(correction)
+                    self._chain_root[ev.event_id] = self._chain_root[target_id]
+                else:
+                    self._chain_root[ev.event_id] = (
+                        self._chain_root[target_id]
+                        if target_id is not None
+                        else ev.event_id
+                    )
+                self._add(ev)
+            i += 1
+        self._next_group_index = i
+        self.revision = revision
+        return _ReplayStep(
+            revision=revision,
+            became_effective=tuple(became),
+            first_corrections=tuple(corrections),
+        )
+
+    # -- snapshot views ----------------------------------------------------
+
+    def participant_total(self, participant_id: str) -> int:
+        """Effective total of one participant at the current revision."""
+        return self._totals.get(participant_id, 0)
+
+    def is_effective(self, event_id: str) -> bool:
+        return event_id in self._effective
+
+    def effective_event_ids(self) -> frozenset[str]:
+        return frozenset(self._effective)
+
+    def ordered_totals(self) -> list[Tuple[str, int]]:
+        """``(participant_id, total)`` in ``(-total, participant_id)`` order."""
+        return sorted(self._totals.items(), key=lambda kv: (-kv[1], kv[0]))
+
+    def rank_positions(self) -> dict[str, RankPosition]:
+        """``{participant_id: (rank, total_points)}`` at the current revision.
+
+        ``revision == 0`` (or an empty replay prefix) yields the empty
+        snapshot, matching the revision=0 semantics of the range endpoints.
+        """
+        return _rank_positions(self.ordered_totals())
+
+    def chain_leaves(self, chain_root: str) -> frozenset[str]:
+        """Effective leaf event_ids of one correction chain at the revision."""
+        return frozenset(
+            event_id
+            for event_id, root in self._chain_root.items()
+            if root == chain_root and event_id in self._effective
+        )
+
+    def fork_roots(self) -> frozenset[str]:
+        """Chain roots whose effective tree currently contains a fork.
+
+        A chain is forked iff it has at least two effective leaves: the
+        shared ancestor is removed at the first fork while every branch tip
+        stays effective.
+        """
+        leaves_per_root: dict[str, int] = {}
+        for event_id in self._effective:
+            root = self._chain_root[event_id]
+            leaves_per_root[root] = leaves_per_root.get(root, 0) + 1
+        return frozenset(root for root, count in leaves_per_root.items() if count >= 2)
+
+
 def leaderboard(revision: Optional[int] = None) -> LeaderboardOut:
     """Leaderboard as of ``revision`` (default: latest).
 
@@ -578,7 +804,8 @@ def leaderboard_changes(
 
     Validation order: ordering errors (negative, ``from >= to``) are 422;
     revisions beyond the current maximum are 404. ``from_revision == 0``
-    compares against the empty leaderboard.
+    compares against the empty leaderboard. Both snapshots come from one
+    single-pass :class:`SnapshotTimeline` replay over one range read.
     """
     if from_revision < 0 or from_revision >= to_revision:
         raise HTTPException(
@@ -597,8 +824,12 @@ def leaderboard_changes(
             raise HTTPException(
                 status_code=404, detail=f"revision {to_revision} not found"
             )
-        before_map = _snapshot(conn, from_revision)
-        after_map = _snapshot(conn, to_revision)
+        timeline = SnapshotTimeline.load(conn, to_revision)
+
+    timeline.advance_to(from_revision)
+    before_map = timeline.rank_positions()
+    timeline.advance_to(to_revision)
+    after_map = timeline.rank_positions()
 
     return LeaderboardChangesOut(
         from_revision=from_revision,
@@ -936,10 +1167,11 @@ def participant_compare(
     effective totals are computed under the same rule as ``/leaderboard``:
     an event counts iff it exists at R and no correction existing at R
     supersedes it. Rather than re-running the snapshot query per revision,
-    events are replayed once in revision order: an event becomes effective
-    the moment it is written (corrections always carry larger revisions) and
-    stops being effective at its *first* direct correction — so a correction
-    that re-attributes an event from participant A to B subtracts from A and
+    the event set (``revision <= to_revision``) is read once and replayed by
+    a :class:`SnapshotTimeline`: an event becomes effective the moment it is
+    written (corrections always carry larger revisions) and stops being
+    effective at its *first* direct correction — so a correction that
+    re-attributes an event from participant A to B subtracts from A and
     adds to B at the correction's own revision. Consecutive snapshots with
     identical totals on both sides merge into one closed interval.
 
@@ -966,40 +1198,13 @@ def participant_compare(
             raise HTTPException(
                 status_code=404, detail=f"revision {to_revision} not found"
             )
-        rows = conn.execute(
-            "SELECT event_id, participant_id, points, correction_of, revision"
-            " FROM events WHERE revision <= ? ORDER BY revision ASC",
-            (to_revision,),
-        ).fetchall()
+        timeline = SnapshotTimeline.load(conn, to_revision)
 
-    by_revision: dict[int, list[sqlite3.Row]] = {}
-    for r in rows:
-        by_revision.setdefault(r["revision"], []).append(r)
-
-    points_by_id: dict[str, Tuple[str, int]] = {}
-    superseded: set[str] = set()
-    left_total = right_total = 0
     intervals: list[CompareIntervalOut] = []
-    for rev in range(0, to_revision + 1):
-        for r in by_revision.get(rev, ()):
-            pid = r["participant_id"]
-            if pid == left_id:
-                left_total += r["points"]
-            if pid == right_id:
-                right_total += r["points"]
-            points_by_id[r["event_id"]] = (pid, r["points"])
-            target = r["correction_of"]
-            if target is not None and target not in superseded:
-                # First correction of ``target``: it stops being effective at
-                # this revision, so its points leave the old owner's total.
-                superseded.add(target)
-                t_pid, t_points = points_by_id[target]
-                if t_pid == left_id:
-                    left_total -= t_points
-                if t_pid == right_id:
-                    right_total -= t_points
-        if rev < from_revision:
-            continue
+    for rev in range(from_revision, to_revision + 1):
+        timeline.advance_to(rev)
+        left_total = timeline.participant_total(left_id)
+        right_total = timeline.participant_total(right_id)
         if (
             intervals
             and intervals[-1].left_points == left_total
@@ -1042,14 +1247,16 @@ def threshold_intervals(
     The participant's effective total is recomputed for *every* revision in
     ``[from_revision, to_revision]`` under the same rule as ``/leaderboard``:
     an event counts iff it exists at R and no correction existing at R
-    supersedes it. Events are replayed once in revision order (same machinery
-    as ``/participants/compare``): an event becomes effective the moment it is
-    written and stops being effective at its *first* direct correction, so a
-    correction that re-attributes an event from participant A to B subtracts
-    from A and adds to B at the correction's own revision; a forked chain
-    keeps every branch tip effective and supersedes the shared ancestor only
-    once. Hence rises and falls caused by correction-chain forks and by
-    cross-participant corrections are all reflected.
+    supersedes it. The event set (``revision <= to_revision``) is read once
+    and replayed by a :class:`SnapshotTimeline` (the same single-pass engine
+    as ``/participants/compare`` and ``/leaderboard/changes``): an event
+    becomes effective the moment it is written and stops being effective at
+    its *first* direct correction, so a correction that re-attributes an
+    event from participant A to B subtracts from A and adds to B at the
+    correction's own revision; a forked chain keeps every branch tip
+    effective and supersedes the shared ancestor only once. Hence rises and
+    falls caused by correction-chain forks and by cross-participant
+    corrections are all reflected.
 
     Consecutive revisions whose recomputed total is ``>= threshold`` (border
     inclusive) merge into one closed interval; endpoints carry the totals at
@@ -1078,35 +1285,12 @@ def threshold_intervals(
             raise HTTPException(
                 status_code=404, detail=f"revision {to_revision} not found"
             )
-        rows = conn.execute(
-            "SELECT event_id, participant_id, points, correction_of, revision"
-            " FROM events WHERE revision <= ? ORDER BY revision ASC",
-            (to_revision,),
-        ).fetchall()
+        timeline = SnapshotTimeline.load(conn, to_revision)
 
-    by_revision: dict[int, list[sqlite3.Row]] = {}
-    for r in rows:
-        by_revision.setdefault(r["revision"], []).append(r)
-
-    points_by_id: dict[str, Tuple[str, int]] = {}
-    superseded: set[str] = set()
-    total = 0
     intervals: list[ThresholdIntervalOut] = []
-    for rev in range(0, to_revision + 1):
-        for r in by_revision.get(rev, ()):
-            if r["participant_id"] == participant_id:
-                total += r["points"]
-            points_by_id[r["event_id"]] = (r["participant_id"], r["points"])
-            target = r["correction_of"]
-            if target is not None and target not in superseded:
-                # First correction of ``target``: it stops being effective at
-                # this revision, so its points leave the old owner's total.
-                superseded.add(target)
-                t_pid, t_points = points_by_id[target]
-                if t_pid == participant_id:
-                    total -= t_points
-        if rev < from_revision:
-            continue
+    for rev in range(from_revision, to_revision + 1):
+        timeline.advance_to(rev)
+        total = timeline.participant_total(participant_id)
         if total >= threshold:
             if intervals and intervals[-1].end_revision == rev - 1:
                 intervals[-1].end_revision = rev
